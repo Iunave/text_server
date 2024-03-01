@@ -1,0 +1,3 @@
+[submodule "third_party/slotmap"]
+	path = third_party/slotmap
+	url = https://github.com/Iunave/slotmap.git
