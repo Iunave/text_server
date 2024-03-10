@@ -14,10 +14,11 @@
 #include <atomic>
 #include <vector>
 #include <sys/poll.h>
+#include <iostream>
 
 #include "common.hpp"
 
-ssize_t send_message(int32_t to_socket, client_message_type type, uint16_t size, void* data)
+ssize_t send_message(int32_t to_socket, client_message_type_t type, uint16_t size, const void* data)
 {
     client_message_header_t header{
             .type = type,
@@ -47,54 +48,111 @@ ssize_t recieve_message(server_message_t* out_message, int32_t server_socket)
     return ret;
 }
 
-bool valid_username(const char* str)
+std::string prompt_username()
 {
-    return true;
-}
-
-char* prompt_username()
-{
-    std::printf("login username: ");
-
-    char* username = nullptr;
-    size_t name_len = 0;
-    size_t nread = 0;
-
-    do
+    auto valid_username = [](std::string_view username)
     {
-        nread = getline(&username, &name_len, stdin);
-        username[nread - 1] = '\0';
-    }
-    while(!valid_username(username));
+        for(char letter : username)
+        {
+            if(username.length() >= 32)
+            {
+                return false;
+            }
 
-    return username;
-}
+            if(!(letter >= '!' && letter <= '~')) //space not included
+            {
+                return false;
+            }
+        }
+        return true;
+    };
 
-bool valid_text(const char* str)
-{
-    return true;
-}
-
-char* prompt_text()
-{
-    std::printf("send text message: ");
-
-    char* text = nullptr;
-    size_t text_len = 0;
-    size_t nread = 0;
-
-    do
+    while(true)
     {
-        nread = getline(&text, &text_len, stdin);
-        text[nread - 1] = '\0';
-    }
-    while(!valid_text(text));
+        std::printf("login username: ");
 
-    return text;
+        std::string username{};
+        getline(std::cin, username);
+
+        if(valid_username(username))
+        {
+            return username;
+        }
+        else
+        {
+            std::printf("invalid username\n");
+        }
+    }
+}
+
+std::string prompt_text()
+{
+    auto valid_text = [](std::string_view text)
+    {
+        for(char letter : text)
+        {
+            if(!(letter >= ' ' && letter <= '~'))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    while(true)
+    {
+        std::string text{};
+        getline(std::cin, text);
+
+        if(valid_text(text))
+        {
+            return text;
+        }
+        else
+        {
+            std::printf("invalid text message\n");
+        }
+    }
+}
+
+inline int32_t server_socket = -1;
+std::atomic<bool> has_connection = false;
+
+void* server_listener(void* user_data)
+{
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr);
+
+    while(true)
+    {
+        server_message_t message{};
+        ssize_t ret = recieve_message(&message, server_socket);
+
+        if(ret <= 0)
+        {
+            std::printf("lost connection to server %zi\n", ret);
+            has_connection.store(false, std::memory_order_relaxed);
+            pthread_exit(nullptr);
+        }
+
+        if(message.header.type == server_message_type::text)
+        {
+            std::printf("%s\n", reinterpret_cast<char*>(message.data.get()));
+        }
+    }
+}
+
+void signal_handler(int signal, siginfo_t* info, void* user_data)
+{
+    has_connection.store(false, std::memory_order_relaxed);
 }
 
 int32_t main(int32_t argc, const char** argv)
 {
+    struct sigaction signal_action{};
+    signal_action.sa_sigaction = signal_handler;
+    sigaction(SIGTERM | SIGINT, &signal_action, nullptr);
+
     if(argc != 3)
     {
         std::printf("specify the IP and PORT to connect to\n");
@@ -115,7 +173,7 @@ int32_t main(int32_t argc, const char** argv)
         return EXIT_FAILURE;
     }
 
-    int32_t server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if(server_socket == -1)
     {
         perror("failed to create tcp socket");
@@ -136,11 +194,12 @@ int32_t main(int32_t argc, const char** argv)
 
     std::printf("connected to server %s:%s\n", argv[1], argv[2]);
 
+    has_connection.store(true, std::memory_order_relaxed);
+
     while(true)
     {
-        char* username = prompt_username();
-        ssize_t ret = send_message(server_socket, client_message_type::login, strlen(username) + 1, username);
-        free(username);
+        std::string username = prompt_username();
+        ssize_t ret = send_message(server_socket, client_message_type_t::login, username.length() + 1, username.c_str());
 
         if(ret == 0)
         {
@@ -174,27 +233,36 @@ int32_t main(int32_t argc, const char** argv)
         }
         else
         {
+            std::printf("successfully logged in as \"%s\"\n", username.c_str());
             break;
         }
     }
 
-    while(true)
+    pthread_t server_listener_thread{};
+    if(pthread_create(&server_listener_thread, nullptr, &::server_listener, nullptr) != 0)
     {
-        char* text = prompt_text();
-        ssize_t send_text_result = send_message(server_socket, client_message_type::text, strlen(text) + 1, text);
-        free(text);
+        std::printf("error launching server listener\n");
+        return EXIT_FAILURE;
+    }
+
+    while(has_connection.load(std::memory_order_relaxed))
+    {
+        std::string text = prompt_text();
+        ssize_t send_text_result = send_message(server_socket, client_message_type_t::text, text.length() + 1, text.c_str());
 
         if(send_text_result == 0)
         {
             std::printf("lost connection to server\n");
-            return EXIT_FAILURE;
+            break;
         }
         else if(send_text_result == -1)
         {
             perror("error sending text");
-            return EXIT_FAILURE;
+            break;
         }
     }
+
+    (void)pthread_join(server_listener_thread, nullptr);
 
     if(close(server_socket) == -1)
     {

@@ -16,35 +16,54 @@
 #include <sys/poll.h>
 #include <atomic>
 #include <chrono>
-#include <unordered_map>
 
 #include "common.hpp"
+#include "slotmap/slotmap.hpp"
 
 struct client_t
 {
-    pthread_t listener;
-    sockaddr_in address;
-    int32_t socket;
+    char username[32] = {'\0'};
+    pthread_t listener = -1;
+    sockaddr_in address = {static_cast<sa_family_t>(-1)};
+    int32_t socket = -1;
 };
+
+struct connected_client_t
+{
+    sockaddr_in address = {static_cast<sa_family_t>(-1)};
+    int32_t socket = -1;
+};
+
+struct SlotMapClientTraits
+{
+    static constexpr int64_t IndexBits = 32;
+    static constexpr int64_t IdBits = 64 - IndexBits;
+    static constexpr int64_t MinFreeKeys = 64;
+    static constexpr int64_t AllocationSize = 512;
+};
+
+sig_atomic_t shutdown_server = 0;
+
+SlotMap<client_t, SlotMapClientTraits> clients{};
+pthread_rwlock_t clients_lock{};
 
 struct stored_message_t
 {
-    client_message_header_t header;
-    std::unique_ptr<uint8_t[]> data;
-    std::shared_ptr<client_t> client;
+    client_message_header_t header = {};
+    std::unique_ptr<uint8_t[]> data = nullptr;
+    decltype(clients)::KeyHandle client = {};
 };
 
-std::string client_address_string(const client_t* client)
-{
-    return std::string{inet_ntoa(client->address.sin_addr)} + ":" + std::to_string(client->address.sin_port);
-}
+std::vector<stored_message_t> messages{};
+pthread_mutex_t messages_mx{};
+pthread_cond_t messages_cv{};
 
-inline std::atomic<bool> shutdown_server = false;
-inline std::vector<client_t> clients{};
-inline std::vector<stored_message_t> messages{};
-inline pthread_mutex_t messages_mx{};
-inline pthread_cond_t messages_cv{};
-inline std::unordered_map<client_t*, std::string> usernames{};
+void* client_listener_routine(void* user_data);
+
+std::string address2string(sockaddr_in address)
+{
+    return std::string{inet_ntoa(address.sin_addr)} + ":" + std::to_string(address.sin_port);
+}
 
 ssize_t recieve_message(client_message_t* out_message, int32_t client_socket)
 {
@@ -59,7 +78,7 @@ ssize_t recieve_message(client_message_t* out_message, int32_t client_socket)
     return ret;
 }
 
-ssize_t send_message(int32_t to_socket, server_message_type type, uint16_t size, void* data)
+ssize_t send_message(int32_t to_socket, server_message_type type, uint16_t size, const void* data)
 {
     server_message_header_t header{
             .type = type,
@@ -78,53 +97,135 @@ ssize_t send_message(int32_t to_socket, server_message_type type, uint16_t size,
 
 namespace response
 {
-    void login(stored_message_t& message)
+    void connected(stored_message_t& message)
     {
-        std::string username{reinterpret_cast<char*>(message.data.get())};
-        std::printf("recieved login from %s with username %s\n", client_address_string(message.client.get()).c_str(), username.c_str());
+        auto connected_client = reinterpret_cast<connected_client_t*>(message.data.get());
 
-        std::string login_response = "success";
+        pthread_rwlock_wrlock(&clients_lock);
 
-        auto[it, unique] = usernames.insert(std::make_pair(message.client.get(), username));
-        if(!unique)
+        auto client_handle = clients.Add();
+        client_t* new_client = clients[client_handle];
+
+        new_client->address = connected_client->address;
+        new_client->socket = connected_client->socket;
+
+        static_assert(sizeof(void*) == sizeof(decltype(client_handle)));
+
+        int32_t ret = pthread_create(&new_client->listener, nullptr, &::client_listener_routine, std::bit_cast<void*>(client_handle));
+        if(ret != 0)
         {
-            login_response = "already logged in";
+            std::printf("failed to launch listener thread: %i\n", ret);
+            clients.Remove(client_handle);
         }
         else
         {
-            for(auto user_it = usernames.begin(); user_it != usernames.end(); ++user_it)
+            std::printf("added connection from %s\n", address2string(connected_client->address).c_str());
+        }
+
+        pthread_rwlock_unlock(&clients_lock);
+    }
+
+    void disconnected(stored_message_t& message)
+    {
+        auto disconnection_reason = reinterpret_cast<ssize_t*>(message.data.get());
+        client_t disconnected_client;
+
+        pthread_rwlock_rdlock(&clients_lock);
+        disconnected_client = *clients[message.client];
+        pthread_rwlock_unlock(&clients_lock);
+
+        if(*disconnection_reason == 0)
+        {
+            std::printf("client %s disconnected\n", address2string(disconnected_client.address).c_str());
+        }
+        else
+        {
+            std::printf("client %s disconnected erronously %s\n", address2string(disconnected_client.address).c_str(), strerror(*disconnection_reason));
+        }
+
+        pthread_rwlock_wrlock(&clients_lock);
+        clients.Remove(message.client);
+        pthread_rwlock_unlock(&clients_lock);
+
+        pthread_join(disconnected_client.listener, nullptr);
+    }
+
+    void login(stored_message_t& message)
+    {
+        char username[32]{0};
+        for(uint64_t idx = 0; message.data.get()[idx] != 0; ++idx)
+        {
+            username[idx] = reinterpret_cast<char*>(message.data.get())[idx];
+        }
+
+        std::string login_response = "success";
+
+        pthread_rwlock_rdlock(&clients_lock);
+        const client_t client = *clients[message.client];
+
+        if(client.username[0] != '\0')
+        {
+            login_response = "client already logged in";
+        }
+        else
+        {
+            for(client_t& existing_client : clients)
             {
-                if(it != user_it && user_it->second == username)
+                if(std::memcmp(&username[0], &existing_client.username[0], 32) == 0)
                 {
-                    login_response = "another user with that name already exists";
-                    usernames.erase(it);
-                    it = usernames.end();
+                    login_response = "username not unique";
                     break;
                 }
             }
         }
 
-        ssize_t ret = send_message(message.client->socket, server_message_type::login_response, login_response.size() + 1, login_response.data());
-        if(ret <= 0)
+        pthread_rwlock_unlock(&clients_lock);
+
+        std::printf("recieved login request from %s with username: %s, result: %s\n", address2string(client.address).c_str(), username, login_response.c_str());
+
+        if(login_response == "success")
         {
-            if(it != usernames.end())
-            {
-                usernames.erase(it);
-            }
+            pthread_rwlock_wrlock(&clients_lock);
+            std::memcpy(&clients[message.client]->username[0], &username[0], 32);
+            pthread_rwlock_unlock(&clients_lock);
         }
+
+        (void)send_message(client.socket, server_message_type::login_response, login_response.length() + 1, login_response.c_str());
     }
 
     void text(stored_message_t& message)
     {
-        std::printf("%s %s\n ", client_address_string(message.client.get()).c_str(), reinterpret_cast<char*>(message.data.get()));
+        pthread_rwlock_rdlock(&clients_lock);
+        const client_t sender = *clients[message.client];
+        pthread_rwlock_unlock(&clients_lock);
+
+        if(sender.username[0] != '\0')
+        {
+            std::string text_message = std::string{sender.username} + ": " + std::string{reinterpret_cast<char*>(message.data.get())};
+            std::printf("%s\n", text_message.c_str());
+
+            pthread_rwlock_rdlock(&clients_lock);
+
+            for(client_t& client : clients)
+            {
+                if(client.socket != sender.socket)
+                {
+                    (void)send_message(client.socket, server_message_type::text, text_message.length() + 1, text_message.c_str());
+                }
+            }
+
+            pthread_rwlock_unlock(&clients_lock);
+        }
     }
 }
 
 inline constexpr auto client_message_responses = []() constexpr
 {
-    std::array<void(*)(stored_message_t&), static_cast<size_t>(client_message_type::MAX)> responses{};
-    responses[static_cast<uint64_t>(client_message_type::login)] = &response::login;
-    responses[static_cast<uint64_t>(client_message_type::text)] = &response::text;
+    std::array<void(*)(stored_message_t&), static_cast<size_t>(client_message_type_t::MAX)> responses{};
+    responses[static_cast<size_t>(client_message_type_t::connected)] = &response::connected;
+    responses[static_cast<size_t>(client_message_type_t::disconnected)] = &response::disconnected;
+    responses[static_cast<size_t>(client_message_type_t::login)] = &response::login;
+    responses[static_cast<size_t>(client_message_type_t::text)] = &response::text;
     return responses;
 }();
 
@@ -133,39 +234,57 @@ void* client_listener_routine(void* user_data)
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr);
 
-    std::shared_ptr<client_t> client{static_cast<client_t*>(user_data)};
+    auto client_handle = std::bit_cast<decltype(clients)::KeyHandle>(user_data);
+
+    pthread_rwlock_rdlock(&clients_lock);
+    const int32_t socket = clients[client_handle]->socket;
+    pthread_rwlock_unlock(&clients_lock);
 
     while(true)
     {
-        client_message_t message{};
-        ssize_t ret = recieve_message(&message, client->socket);
+        client_message_t recieved_message{};
+        ssize_t ret = recieve_message(&recieved_message, socket);
 
-        if(ret == 0)
+        stored_message_t stored_message{};
+
+        if(ret == 0 || ret == -1)
         {
-            std::printf("client disconnected %s\n", client_address_string(client.get()).c_str());
-            pthread_exit(nullptr);
+            stored_message.header.type = client_message_type_t::disconnected;
+            stored_message.header.size = sizeof(uint64_t);
+            stored_message.client = client_handle;
+            stored_message.data = std::make_unique<uint8_t[]>(sizeof(ssize_t));
+
+            if(ret == 0)
+            {
+                *reinterpret_cast<ssize_t*>(stored_message.data.get()) = 0;
+            }
+            else
+            {
+                *reinterpret_cast<ssize_t*>(stored_message.data.get()) = errno;
+            }
         }
-        else if(ret == -1)
+        else
         {
-            perror(client_address_string(client.get()).c_str());
-            pthread_exit(nullptr);
+            stored_message.header = recieved_message.header;
+            stored_message.client = client_handle;
+            stored_message.data = std::move(recieved_message.data);
         }
 
         pthread_mutex_lock(&messages_mx);
 
-        stored_message_t& stored_message = messages.emplace_back();
-        stored_message.header = message.header;
-        stored_message.data = std::move(message.data);
-        stored_message.client = client;
+        messages.emplace_back(std::move(stored_message));
 
         pthread_cond_signal(&messages_cv);
         pthread_mutex_unlock(&messages_mx);
-    }
 
-    pthread_exit(nullptr);
+        if(ret == 0 || ret == -1)
+        {
+            pthread_exit(nullptr);
+        }
+    }
 }
 
-void* message_queue_handler(void* user_data)
+void* message_queue_handler(void*)
 {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr);
@@ -184,31 +303,33 @@ void* message_queue_handler(void* user_data)
 
         pthread_mutex_unlock(&messages_mx);
 
+        for(stored_message_t& message : moved_messages) //process connections and disconnections first
+        {
+            auto msgtype = message.header.type;
+            if(msgtype == client_message_type_t::connected || msgtype == client_message_type_t::disconnected)
+            {
+                client_message_responses[static_cast<size_t>(msgtype)](message);
+            }
+        }
+
         for(stored_message_t& message : moved_messages)
         {
-            uint64_t message_type = static_cast<uint64_t>(message.header.type);
-
-            if(message_type < client_message_responses.size())
+            auto msgtype = message.header.type;
+            if(msgtype != client_message_type_t::connected && msgtype != client_message_type_t::disconnected)
             {
-                client_message_responses[message_type](message);
-            }
-            else
-            {
-                std::printf("invalid message type %lu. ignoring\n", message_type);
+                client_message_responses[static_cast<size_t>(msgtype)](message);
             }
         }
 
         moved_messages.clear();
     }
-
-    pthread_exit(nullptr);
 }
 
 void signal_handler(int signal, siginfo_t* info, void* user_data)
 {
     if(signal == SIGTERM)
     {
-        shutdown_server.store(true, std::memory_order_relaxed);
+        shutdown_server = 1;
     }
 }
 
@@ -231,6 +352,7 @@ int32_t main(int32_t argc, const char** argv)
     signal_action.sa_sigaction = signal_handler;
     sigaction(SIGTERM | SIGINT, &signal_action, nullptr);
 
+    pthread_rwlock_init(&clients_lock, nullptr);
     pthread_mutex_init(&messages_mx, nullptr);
     pthread_cond_init(&messages_cv, nullptr);
 
@@ -270,14 +392,13 @@ int32_t main(int32_t argc, const char** argv)
         return EXIT_FAILURE;
     }
 
-    while(!shutdown_server.load(std::memory_order_relaxed))
+    while(shutdown_server == 0)
     {
-        client_t new_client{};
-        socklen_t client_len = sizeof(new_client.address);
+        sockaddr_in client_address{};
+        socklen_t address_len = sizeof(client_address);
 
-        new_client.socket = accept(server_socket, reinterpret_cast<sockaddr*>(&new_client.address), &client_len);
-
-        if(new_client.socket == -1)
+        int32_t client_socket = accept(server_socket, reinterpret_cast<sockaddr*>(&client_address), &address_len);
+        if(client_socket == -1)
         {
             if(errno != EINTR)
             {
@@ -286,32 +407,20 @@ int32_t main(int32_t argc, const char** argv)
             continue;
         }
 
-        std::printf("accepted connection from %s\n", inet_ntoa(new_client.address.sin_addr));
+        stored_message_t stored_message{};
+        stored_message.header.type = client_message_type_t::connected;
+        stored_message.header.size = sizeof(connected_client_t);
+        stored_message.client = decltype(clients)::NullHandle;
+        stored_message.data = std::make_unique<uint8_t[]>(sizeof(connected_client_t));
+        reinterpret_cast<connected_client_t*>(stored_message.data.get())->address = client_address;
+        reinterpret_cast<connected_client_t*>(stored_message.data.get())->socket = client_socket;
 
-        for(uint64_t idx = 0; idx < clients.size(); ++idx)
-        {
-            if(pthread_tryjoin_np(clients[idx].listener, nullptr) == 0)
-            {
-                if(close(clients[idx].socket) == -1)
-                {
-                    perror("failed to close client socket");
-                }
+        pthread_mutex_lock(&messages_mx);
 
-                clients[idx] = clients.back();
-                clients.pop_back();
-                --idx;
-            }
-        }
+        messages.emplace_back(std::move(stored_message));
 
-        auto* client_copy = new client_t{new_client};
-        if(pthread_create(&new_client.listener, nullptr, &::client_listener_routine, client_copy) != 0)
-        {
-            perror("failed to launch client listener thread");
-            delete client_copy;
-            continue;
-        }
-
-        clients.emplace_back(new_client);
+        pthread_cond_signal(&messages_cv);
+        pthread_mutex_unlock(&messages_mx);
     }
 
     for(const client_t& client : clients)
@@ -323,7 +432,6 @@ int32_t main(int32_t argc, const char** argv)
             perror("failed to close client socket");
         }
     }
-
 
     (void)pthread_cancel(message_handler_thread);
 
